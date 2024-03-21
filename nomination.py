@@ -1,3 +1,5 @@
+from datetime import datetime
+
 class Nomination:
     def __init__(self):
         self.nominations = []
@@ -13,3 +15,6 @@ class Nomination:
 
     def is_candidate_nominated(self, candidate):
         return candidate in self.nominations
+    
+    def is_nomination_period_open(self):
+        return datetime.now().weekday() < 5
