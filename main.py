@@ -69,11 +69,14 @@ def run():
         nominee_votes = nominees.get_votes()  # Fetch the vote count from your database or wherever it is stored
         total_votes = sum(nominee_votes.values())  # Calculate the total number of votes
 
+        # Sort the nominee_votes dictionary by vote count in descending order
+        sorted_nominee_votes = {k: v for k, v in sorted(nominee_votes.items(), key=lambda item: item[1], reverse=True)}
+
         # Create an embed to display the vote count
         embed = discord.Embed(title="Current Vote Count", color=0x00ff00)
 
         # Add each nominee's vote count and percentage to the embed
-        for nominee_id, votes in nominee_votes.items():
+        for nominee_id, votes in sorted_nominee_votes.items():
             nominee = interaction.guild.get_member(int(nominee_id))
             if nominee:
                 # Calculate the percentage of votes for the nominee
@@ -84,8 +87,8 @@ def run():
                 embed.add_field(name=nominee.display_name, value=f"Votes: {votes} ({percentage:.2f}%)", inline=False)
         
         # Find the member(s) with the most votes
-        max_votes = max(nominee_votes.values())
-        winners = [interaction.guild.get_member(int(nominee_id)) for nominee_id, votes in nominee_votes.items() if votes == max_votes]
+        max_votes = max(sorted_nominee_votes.values())
+        winners = [interaction.guild.get_member(int(nominee_id)) for nominee_id, votes in sorted_nominee_votes.items() if votes == max_votes]
 
         if len(winners) == 1:
             # Send a message announcing the winner
