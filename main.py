@@ -19,8 +19,12 @@ class ElectionSelect(discord.ui.Select):
 
 class ElectionView(discord.ui.View):
     def __init__(self, nominee_list):
-        super().__init__()
+        super().__init__(timeout=28800) # 8 hours
         self.add_item(ElectionSelect(nominee_list))
+    
+    async def on_timeout(self):
+        logger.info("ElectionView timed out")
+        self.clear_items()
 
 def run():
     intents = discord.Intents.default()
