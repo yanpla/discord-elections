@@ -16,7 +16,8 @@ class Nomination:
         with open(self.csv_file, mode='r') as file:
             reader = csv.reader(file)
             for row in reader:
-                nominations.append((row[0], row[1]))
+                if len(row) > 1:  # Ensure there are enough elements in the row
+                    nominations.append((row[0], row[1]))
         return nominations
 
     def clear_nominations(self):
@@ -26,7 +27,7 @@ class Nomination:
         with open(self.csv_file, mode='r') as file:
             reader = csv.reader(file)
             for row in reader:
-                if row[0] == str(candidate.id):
+                if len(row) > 0 and row[0] == str(candidate.id):
                     return True
         return False
     
@@ -42,7 +43,7 @@ class Nomination:
         with open(self.votes_csv, mode='r') as file:
             reader = csv.reader(file)
             for row in reader:
-                if row[0] != voter_id:  # Skip rows for this voter
+                if len(row) > 0 and row[0] != voter_id:  # Skip rows for this voter
                     rows.append(row)
 
         # Write the new vote
@@ -57,9 +58,10 @@ class Nomination:
         with open(self.votes_csv, mode='r') as file:
             reader = csv.reader(file)
             for row in reader:
-                nominee_id = row[1]
-                if nominee_id not in votes:
-                    votes[nominee_id] = 1
-                else:
-                    votes[nominee_id] += 1
+                if len(row) > 1:  # Ensure there are enough elements in the row
+                    nominee_id = row[1]
+                    if nominee_id not in votes:
+                        votes[nominee_id] = 1
+                    else:
+                        votes[nominee_id] += 1
         return votes
