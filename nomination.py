@@ -1,11 +1,20 @@
 import csv
 import os
-from datetime import datetime
 
 class Nomination:
     def __init__(self):
         self.csv_file = "nominees.csv"
         self.votes_csv = "votes.csv"
+        self.nomination_period_open = False
+    
+    def open_nomination_period(self):
+        self.nomination_period_open = True
+
+    def close_nomination_period(self):
+        self.nomination_period_open = False
+
+    def is_nomination_period_open(self):
+        return self.nomination_period_open
 
     def check_and_create_file(self, file_path):
         if not os.path.exists(file_path):
@@ -39,9 +48,6 @@ class Nomination:
                 if len(row) > 0 and row[0] == str(candidate.id):
                     return True
         return False
-    
-    def is_nomination_period_open(self):
-        return datetime.now().weekday() < 5
     
     def clear_votes(self):
         self.check_and_create_file(self.votes_csv)

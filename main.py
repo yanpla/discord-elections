@@ -1,10 +1,313 @@
 import settings
 import discord
 from discord.ext import commands
+from discord import app_commands
 from nomination import Nomination
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import datetime
+from apscheduler.triggers.date import DateTrigger
+from scheduler import load_schedule, save_schedule
 
 logger = settings.logging.getLogger("bot")
 nominees = Nomination()
+
+class ElectionBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.message_content = True
+        intents.presences = True
+        super().__init__(command_prefix=".", intents=intents)
+        self.scheduler = AsyncIOScheduler()
+        self.schedule_data = load_schedule()
+
+        self.guild_object = discord.Object(id=settings.GUILDS_ID)
+
+        # Register commands directly in the class
+        self.tree.command(name="nominateme", description="Nominate yourself", guild=self.guild_object)(self.nominateme)
+        self.tree.command(
+            name="force_start_nominations", 
+            description="ADMIN: Start nomination period immediately",
+            guild=self.guild_object
+        )(self.force_start_nominations)
+        
+        self.tree.command(
+            name="force_start_voting", 
+            description="ADMIN: Start voting period immediately",
+            guild=self.guild_object
+        )(self.force_start_voting)
+        
+        self.tree.command(
+            name="force_end_election", 
+            description="ADMIN: End election immediately",
+            guild=self.guild_object
+        )(self.force_end_election)
+
+
+    async def setup_hook(self):
+        await self.tree.sync(guild=self.guild_object)
+        self.scheduler.start()
+        
+        # Check for existing voting phases
+        now = datetime.datetime.now()
+        if 'voting_end' in self.schedule_data:
+            if self.schedule_data['voting_end'] > now:
+                self._schedule_job('end_voting', self.schedule_data['voting_end'], self.end_voting)
+            else:
+                await self.end_voting()
+                
+        elif 'voting_start' in self.schedule_data:
+            if self.schedule_data['voting_start'] > now:
+                self._schedule_job('start_voting', self.schedule_data['voting_start'], self.start_voting)
+            else:
+                await self.start_voting()
+                
+        elif 'nomination_close' in self.schedule_data:
+            if self.schedule_data['nomination_close'] > now:
+                self._schedule_job('close_nominations', self.schedule_data['nomination_close'], self.close_nominations)
+            else:
+                await self.close_nominations()
+                
+        else:
+            await self.schedule_elections()
+
+    async def schedule_elections(self):
+        # Check for existing schedule first
+        if 'nomination_start' in self.schedule_data:
+            next_monday = self.schedule_data['nomination_start']
+            if next_monday > datetime.datetime.now():
+                self._schedule_job('election_cycle', next_monday, self.open_nominations)
+                return
+        
+        # Fallback to default scheduling
+        next_monday = self.get_next_monday()
+        self._schedule_job('election_cycle', next_monday, self.open_nominations)
+        self._update_schedule('nomination_start', next_monday)
+
+    def _schedule_job(self, job_id, when, func):
+        if self.scheduler.get_job(job_id):
+            self.scheduler.remove_job(job_id)
+            
+        self.scheduler.add_job(
+            func,
+            trigger=DateTrigger(when),
+            id=job_id
+        )
+        
+        if not self.scheduler.running:
+            self.scheduler.start()
+
+    def _update_schedule(self, key, when):
+        self.schedule_data[key] = when
+        save_schedule(self.schedule_data)
+
+    def get_next_monday(self):
+        today = datetime.datetime.now()
+        days_ahead = (0 - today.weekday() + 7) % 7  # 0 is Monday
+        next_monday = today + datetime.timedelta(days=days_ahead)
+        return next_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async def open_nominations(self):
+        # Clear existing jobs first
+        for job_id in ['close_nominations', 'start_voting', 'end_voting']:
+            if self.scheduler.get_job(job_id):
+                self.scheduler.remove_job(job_id)
+        nominees.open_nomination_period()
+        announcement_channel = self.get_channel(settings.CHANNEL_ID)
+        
+        # Schedule close for Thursday 23:59
+        thursday = self.get_next_monday() + datetime.timedelta(days=3, hours=23, minutes=59)
+        self.scheduler.add_job(
+            self.close_nominations,
+            trigger=DateTrigger(thursday),
+            id='close_nominations'
+        )
+        self._update_schedule('nomination_close', thursday)
+
+        thursday_ts = int(thursday.timestamp())
+        await announcement_channel.send(
+            f"🏛️ @everyone De nominatieronde is geopend! Gebruik `/nominateme`  om jezelf te nomineren.\n"
+            f"🗓️ Sluit op <t:{thursday_ts}:F> (<t:{thursday_ts}:R>)",
+            allowed_mentions=discord.AllowedMentions(everyone=True)
+        )
+
+    async def close_nominations(self):
+        if self.scheduler.get_job('close_nominations'):
+            self.scheduler.remove_job('close_nominations')
+        nominees.close_nomination_period()
+        announcement_channel = self.get_channel(settings.CHANNEL_ID)
+        await announcement_channel.send("⛔ Nominaties gesloten. Stemmen begint morgen!")
+        
+        # Schedule voting for Friday 00:00
+        now = datetime.datetime.now()
+        friday = (now + datetime.timedelta(days=1)).replace(
+            hour=0, 
+            minute=0, 
+            second=0, 
+            microsecond=0
+        )
+        self.scheduler.add_job(
+            self.start_voting,
+            trigger=DateTrigger(friday),
+            id='start_voting'
+        )
+        self._update_schedule('voting_start', friday)
+
+    async def start_voting(self):
+        if self.scheduler.get_job('start_voting'):
+            self.scheduler.remove_job('start_voting')
+
+        nominee_list = nominees.get_nominations()
+        if not nominee_list:
+            channel = self.get_channel(settings.CHANNEL_ID)
+            await channel.send("❌ No nominees. Election canceled.")
+            return
+            
+        election_channel = self.get_channel(settings.CHANNEL_ID)
+        view = ElectionView(nominee_list)
+        
+        # Schedule vote closing in 24 hours
+        self.scheduler.add_job(
+            self.end_voting,
+            trigger=DateTrigger(datetime.datetime.now() + datetime.timedelta(hours=24)),
+            id='end_voting'
+        )
+        end_time = datetime.datetime.now() + datetime.timedelta(hours=24)
+        self._update_schedule('voting_end', end_time)
+        end_ts = int(end_time.timestamp())    
+        self.vote_message = await election_channel.send(
+            f"🗳️ @everyone Stem op de nieuwe dictator!\n"
+            f"⏳ Stemmen eindigt op <t:{end_ts}:F> (<t:{end_ts}:R>)",
+            view=view,
+            allowed_mentions=discord.AllowedMentions(everyone=True)
+        )
+
+    async def end_voting(self):
+        self.schedule_data = {}
+        save_schedule(self.schedule_data)
+        await self.vote_message.edit(view=None)
+        await self.process_election_results()
+
+    async def process_election_results(self, guild=None, channel=None):
+        try:
+            if not guild:
+                # Use get_guild instead of fetch_guild to access cached members
+                guild = self.get_guild(settings.GUILDS_ID)
+                if not guild:
+                    guild = await self.fetch_guild(settings.GUILDS_ID)
+                    # Refresh member cache if needed
+                    await guild.chunk()
+            if not channel:
+                channel = await guild.fetch_channel(settings.CHANNEL_ID)
+
+            # Election processing logic
+            nominee_votes = nominees.get_votes()
+            total_votes = sum(nominee_votes.values())
+            
+            # Sort votes and filter valid members
+            valid_winners = []
+            max_votes = 0
+            
+            for nominee_id, votes in nominee_votes.items():
+                member = guild.get_member(int(nominee_id))
+                if member:
+                    if votes > max_votes:
+                        max_votes = votes
+                        valid_winners = [member]
+                    elif votes == max_votes:
+                        valid_winners.append(member)
+                else:
+                    logger.warning(f"Invalid member ID in votes: {nominee_id}")
+
+            # Create embed with results
+            embed = discord.Embed(title="Verkiezingen Resultaten", color=0x00ff00)
+            
+            # Add all nominees to embed (even if they left the server)
+            for nominee_id, votes in sorted(nominee_votes.items(), 
+                                        key=lambda item: item[1], 
+                                        reverse=True):
+                member = guild.get_member(int(nominee_id))
+                display_name = member.display_name if member else f"Unknown Member ({nominee_id})"
+                percentage = (votes / total_votes * 100) if total_votes > 0 else 0
+                embed.add_field(name=display_name, 
+                            value=f"Stemmen: {votes} ({percentage:.2f}%)", 
+                            inline=False)
+
+            # Manage dictator role
+            dictator_role = guild.get_role(settings.DICTATOR_ROLE_ID)
+            if not dictator_role:
+                await channel.send("Dictator role not found!")
+                return
+
+            try:
+                # Remove role from current holders
+                current_dictators = [m for m in guild.members if dictator_role in m.roles]
+                for member in current_dictators:
+                    await member.remove_roles(dictator_role, reason="Election concluded")
+                
+                # Assign to valid winners
+                result_message = "@everyone "
+                if valid_winners:
+                    for winner in valid_winners:
+                        await winner.add_roles(dictator_role, reason="Election winner")
+                    
+                    if len(valid_winners) == 1:
+                        result_message += f"🏆 Jullie nieuwe dictator is: {valid_winners[0].mention} met {max_votes} stemmen!"
+                    else:
+                        winner_mentions = ", ".join(w.mention for w in valid_winners)
+                        result_message += f"🤝 Draw between {winner_mentions} with {max_votes} votes!"
+                else:
+                    result_message = "⚠️ No valid winners found!"
+                    
+                await channel.send(result_message, embed=embed)
+                
+            except discord.Forbidden:
+                await channel.send("❌ Missing permissions to manage roles!")
+            except Exception as e:
+                logger.error(f"Election error: {str(e)}", exc_info=True)
+                await channel.send("⚠️ Error processing results!")
+                
+        except Exception as e:
+            logger.error(f"Critical error in election processing: {str(e)}", exc_info=True)
+        finally:
+            nominees.clear_nominations()
+            nominees.clear_votes()
+            await self.schedule_elections()
+
+    async def nominateme(self, interaction: discord.Interaction):
+        candidate = interaction.user
+        if not nominees.is_nomination_period_open():
+            await interaction.response.send_message("The nomination period is closed.", ephemeral=True)
+            return
+        if nominees.is_candidate_nominated(candidate):
+            await interaction.response.send_message(f"{candidate.display_name} is already nominated.", ephemeral=True)
+            return
+            
+        nominees.nominate_candidate(candidate)
+        await interaction.response.send_message(f"{candidate.display_name} has been nominated.")
+
+    @app_commands.checks.has_permissions(administrator=True)
+    async def force_start_nominations(self, interaction: discord.Interaction):
+        """Admin command to start nominations"""
+        await interaction.response.defer(ephemeral=True)
+        await self.open_nominations()
+        await interaction.followup.send("🗳️ Nomination period started!", ephemeral=True)
+
+    @app_commands.checks.has_permissions(administrator=True)
+    async def force_start_voting(self, interaction: discord.Interaction):
+        """Admin command to start voting"""
+        await interaction.response.defer(ephemeral=True)
+        await self.close_nominations()
+        await self.start_voting()
+        await interaction.followup.send("✅ Voting period started!", ephemeral=True)
+
+    @app_commands.checks.has_permissions(administrator=True)
+    async def force_end_election(self, interaction: discord.Interaction):
+        """Admin command to end election"""
+        await interaction.response.defer(ephemeral=True)
+        await self.end_voting()
+        await interaction.followup.send("🏁 Election concluded!", ephemeral=True)
+
 
 class ElectionSelect(discord.ui.Select):
     def __init__(self, nominee_list):
@@ -27,111 +330,14 @@ class ElectionView(discord.ui.View):
         self.clear_items()
 
 def run():
-    intents = discord.Intents.default()
-    intents.members = True
-
-    bot = commands.Bot(command_prefix=".", intents=intents)
-
+    bot = ElectionBot()
+    
     @bot.event
     async def on_ready():
         logger.info(f"User: {bot.user} (ID: {bot.user.id})")
         logger.info("Bot is ready to go!")
-        bot.tree.copy_global_to(guild=settings.GUILDS_ID)
-        await bot.tree.sync(guild=settings.GUILDS_ID)
-
-    @bot.tree.command(description="Nominate yourself", name="nominateme")
-    async def nominateme(interaction: discord.Interaction):
-        candidate = interaction.user
-        # Check if the nomination period is open
-        if not nominees.is_nomination_period_open():
-            await interaction.response.send_message("The nomination period is closed.", ephemeral=True)
-            return
-
-        # Check if the candidate is already nominated
-        if nominees.is_candidate_nominated(candidate):
-            await interaction.response.send_message(f"{candidate.display_name} is already nominated.", ephemeral=True)
-            return
-
-        # Nominate the candidate
-        nominees.nominate_candidate(candidate)
-
-        await interaction.response.send_message(f"{candidate.display_name} has been nominated.")
-
-    @bot.tree.command(description="Start a poll for electing a new dictator", name="startpoll")
-    async def start_poll(interaction: discord.Interaction):
-        # Get the list of nominees
-        nominee_list = nominees.get_nominations()  # Fetch the list of nominees from your database or wherever they are stored
-
-        # Create the ElectionSelect dropdown with the list of nominees
-        view = ElectionView(nominee_list)
-
-        # Send the message with the dropdown and initial vote count embed
-        await interaction.response.send_message("Select a nominee to vote on:", view=view)
-
-    @bot.tree.command(description="End the Election and announce the winner", name="endpoll")
-    async def end_poll(interaction: discord.Interaction):
-        nominee_votes = nominees.get_votes()  # Fetch the vote count from your database or wherever it is stored
-        total_votes = sum(nominee_votes.values())  # Calculate the total number of votes
-
-        # Sort the nominee_votes dictionary by vote count in descending order
-        sorted_nominee_votes = {k: v for k, v in sorted(nominee_votes.items(), key=lambda item: item[1], reverse=True)}
-
-        # Create an embed to display the vote count
-        embed = discord.Embed(title="Current Vote Count", color=0x00ff00)
-
-        # Add each nominee's vote count and percentage to the embed
-        for nominee_id, votes in sorted_nominee_votes.items():
-            nominee = interaction.guild.get_member(int(nominee_id))
-            if nominee:
-                # Calculate the percentage of votes for the nominee
-                if total_votes > 0:
-                    percentage = (votes / total_votes) * 100
-                else:
-                    percentage = 0
-                embed.add_field(name=nominee.display_name, value=f"Votes: {votes} ({percentage:.2f}%)", inline=False)
-        
-        # Find the member(s) with the most votes
-        max_votes = max(sorted_nominee_votes.values())
-        winners = [interaction.guild.get_member(int(nominee_id)) for nominee_id, votes in sorted_nominee_votes.items() if votes == max_votes]
-
-        dictator_role = interaction.guild.get_role(settings.DICTATOR_ROLE_ID)
-        if not dictator_role:
-            await interaction.response.send_message("Dictator role not found.", ephemeral=True)
-            return
-
-        try:
-            # Remove role from all members
-            for member in interaction.guild.members:
-                if dictator_role in member.roles:
-                    await member.remove_roles(dictator_role, reason="Election concluded")
-            
-            # Assign to winner if there's one
-            if len(winners) == 1:
-                winner = winners[0]
-                await winner.add_roles(dictator_role, reason="Election winner")
-                message_content = f"The winner is {winner.display_name} with {max_votes} votes!"
-            else:
-                message_content = "It's a draw! The election resulted in a tie."
-
-            await interaction.response.send_message(message_content, embed=embed)
-            
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to manage roles! Please check my permissions.",
-                ephemeral=True
-            )
-        except Exception as e:
-            logger.error(f"Error in endpoll: {str(e)}")
-            await interaction.response.send_message(
-                "An error occurred while processing the election results.",
-                ephemeral=True
-            )
-        finally:
-            nominees.clear_nominations()
-            nominees.clear_votes()
     
     bot.run(settings.DISCORD_API_SECRET, root_logger=True)
-
 
 if __name__ == "__main__":
     run()
