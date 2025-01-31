@@ -11,6 +11,7 @@ DISCORD_API_SECRET = os.getenv("DISCORD_TOKEN")
 
 GUILDS_ID = discord.Object(id=int(os.getenv("GUILD")))
 GUILD_ID_INT = int(os.getenv("GUILD"))
+DICTATOR_ROLE_ID = int(os.getenv("DICTATOR_ROLE_ID"))
 
 
 LOGGING_CONFIG = {

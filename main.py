@@ -19,7 +19,7 @@ class ElectionSelect(discord.ui.Select):
 
 class ElectionView(discord.ui.View):
     def __init__(self, nominee_list):
-        super().__init__(timeout=28800) # 8 hours
+        super().__init__(timeout=86400) # 24 hours
         self.add_item(ElectionSelect(nominee_list))
     
     async def on_timeout(self):
@@ -94,14 +94,41 @@ def run():
         max_votes = max(sorted_nominee_votes.values())
         winners = [interaction.guild.get_member(int(nominee_id)) for nominee_id, votes in sorted_nominee_votes.items() if votes == max_votes]
 
-        if len(winners) == 1:
-            # Send a message announcing the winner
-            await interaction.response.send_message(f"The winner is {winners[0].display_name} with {max_votes} votes!", embed=embed)
-        else:
-            # Send a message announcing the draw
-            await interaction.response.send_message("It's a draw! The election resulted in a tie.", embed=embed)
-        nominees.clear_nominations()
-        nominees.clear_votes()
+        dictator_role = interaction.guild.get_role(settings.DICTATOR_ROLE_ID)
+        if not dictator_role:
+            await interaction.response.send_message("Dictator role not found.", ephemeral=True)
+            return
+
+        try:
+            # Remove role from all members
+            for member in interaction.guild.members:
+                if dictator_role in member.roles:
+                    await member.remove_roles(dictator_role, reason="Election concluded")
+            
+            # Assign to winner if there's one
+            if len(winners) == 1:
+                winner = winners[0]
+                await winner.add_roles(dictator_role, reason="Election winner")
+                message_content = f"The winner is {winner.display_name} with {max_votes} votes!"
+            else:
+                message_content = "It's a draw! The election resulted in a tie."
+
+            await interaction.response.send_message(message_content, embed=embed)
+            
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to manage roles! Please check my permissions.",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in endpoll: {str(e)}")
+            await interaction.response.send_message(
+                "An error occurred while processing the election results.",
+                ephemeral=True
+            )
+        finally:
+            nominees.clear_nominations()
+            nominees.clear_votes()
     
     bot.run(settings.DISCORD_API_SECRET, root_logger=True)
 
