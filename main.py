@@ -19,6 +19,7 @@ class ElectionBot(commands.Bot):
         intents.presences = True
         super().__init__(command_prefix=".", intents=intents)
         self.scheduler = AsyncIOScheduler()
+        self.schedule_data = self._load_schedule_data()
 
         self.guild_object = discord.Object(id=settings.GUILDS_ID)
 
@@ -49,6 +50,30 @@ class ElectionBot(commands.Bot):
             description="View the election schedule",
             guild=self.guild_object,
         )(self.view_schedule)
+
+    def _load_schedule_data(self):
+        try:
+            with open("last_election.txt", "r") as f:
+                last_timestamp = int(f.read().strip())
+                last_date = datetime.datetime.fromtimestamp(last_timestamp)
+                return {
+                    "last_election": last_date,
+                    "next_election": last_date + datetime.timedelta(weeks=10),
+                }
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _save_schedule_data(self):
+        if "last_election" in self.schedule_data:
+            with open("last_election.txt", "w") as f:
+                timestamp = int(self.schedule_data["last_election"].timestamp())
+                f.write(str(timestamp))
+
+    def _update_schedule(self, key, when):
+        self.schedule_data[key] = when
+        if key == "nomination_start":
+            self.schedule_data["last_election"] = when
+            self._save_schedule_data()
 
     async def setup_hook(self):
         await self.tree.sync(guild=self.guild_object)
@@ -88,21 +113,13 @@ class ElectionBot(commands.Bot):
             await self.schedule_elections()
 
     async def schedule_elections(self):
-        # Try to get last execution date first
-        try:
-            with open("last_election.txt", "r") as f:
-                last_timestamp = int(f.read().strip())
-                last_date = datetime.datetime.fromtimestamp(last_timestamp)
-                next_date = last_date + datetime.timedelta(weeks=10)
-
-                if next_date > datetime.datetime.now():
-                    self._schedule_job(
-                        "election_cycle", next_date, self.open_nominations
-                    )
-                    self._update_schedule("nomination_start", next_date)
-                    return
-        except (FileNotFoundError, ValueError):
-            pass
+        # Use schedule data instead of reading file directly
+        if "next_election" in self.schedule_data:
+            next_date = self.schedule_data["next_election"]
+            if next_date > datetime.datetime.now():
+                self._schedule_job("election_cycle", next_date, self.open_nominations)
+                self._update_schedule("nomination_start", next_date)
+                return
 
         # Fallback to default Monday scheduling
         next_monday = self.get_next_monday()
@@ -118,9 +135,6 @@ class ElectionBot(commands.Bot):
         if not self.scheduler.running:
             self.scheduler.start()
 
-    def _update_schedule(self, key, when):
-        self.schedule_data[key] = when
-
     def get_next_monday(self):
         today = datetime.datetime.now()
         days_ahead = (0 - today.weekday() + 7) % 7  # 0 is Monday
@@ -128,10 +142,10 @@ class ElectionBot(commands.Bot):
         return next_monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
     async def open_nominations(self):
-        # Save current timestamp as last execution
-        current_timestamp = int(datetime.datetime.now().timestamp())
-        with open("last_election.txt", "w") as f:
-            f.write(str(current_timestamp))
+        # Update schedule data instead of writing directly to file
+        current_time = datetime.datetime.now()
+        self.schedule_data["last_election"] = current_time
+        self._save_schedule_data()
 
         # Clear existing jobs first
         for job_id in ["close_nominations", "start_voting", "end_voting"]:
@@ -369,16 +383,13 @@ class ElectionBot(commands.Bot):
         schedule_text += self._format_schedule_date("voting_start", "Voting Starts")
         schedule_text += self._format_schedule_date("voting_end", "Voting Ends")
 
-        # Add last election info
-        try:
-            with open("last_election.txt", "r") as f:
-                last_timestamp = int(f.read().strip())
-                next_date = datetime.datetime.fromtimestamp(
-                    last_timestamp
-                ) + datetime.timedelta(weeks=10)
-                next_ts = int(next_date.timestamp())
-                schedule_text += f"\n🔄 Next election cycle starts: <t:{next_ts}:F> (<t:{next_ts}:R>)"
-        except (FileNotFoundError, ValueError):
+        # Add next election info from schedule data
+        if "next_election" in self.schedule_data:
+            next_ts = int(self.schedule_data["next_election"].timestamp())
+            schedule_text += (
+                f"\n🔄 Next election cycle starts: <t:{next_ts}:F> (<t:{next_ts}:R>)"
+            )
+        else:
             schedule_text += "\n❌ No previous election data found"
 
         if not any(
