@@ -73,7 +73,6 @@ class ElectionBot(commands.Bot):
         self.schedule_data[key] = when
         if key == "nomination_start":
             self.schedule_data["last_election"] = when
-            self._save_schedule_data()
 
     async def setup_hook(self):
         await self.tree.sync(guild=self.guild_object)
